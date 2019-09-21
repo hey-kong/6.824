@@ -88,7 +88,9 @@ type Raft struct {
 	lastApplied	int	// 被应用到状态机的日志的位置
 	// 在领导人里经常变的(选举后重新初始化)
     nextIndex		[]int	// 每个peer都有一个值，是leader要发送给其他peer的下一个日志索引
-    matchIndex		[]int	// 每个peer都有一个值，是leader收到的其他peer已经复制给它的日志的最高索引值
+	matchIndex		[]int	// 每个peer都有一个值，是leader收到的其他peer已经复制给它的日志的最高索引值
+	
+	applyCh			chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -186,6 +188,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId;
 		} else {
+			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
 		}
 		return
@@ -219,6 +222,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
+	}
+
+	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	isMatched := true
+	if len(args.Entries) > 0 {
+		if len(rf.logs) == args.PrevLogIndex+1 {
+			// 可能会缺少一些日志条目
+			isMatched = false
+		} else if rf.logs[args.PrevLogIndex+1].Term != args.Entries[0].Term {
+			// 可能会有一些未被提交的日志条目
+			isMatched = false
+		}
+	}
+
+	if !isMatched {
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
+		rf.logs = append(rf.logs, args.Entries...)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		lastLogIndex := len(rf.logs) - 1
+		if args.LeaderCommit <= lastLogIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastLogIndex
+		}
+		rf.apply()
 	}
 
 	rf.convertTo(Follower)
@@ -285,8 +320,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
-
+	term, isLeader = rf.GetState()
+	if isLeader {
+		rf.mu.Lock()
+		index = len(rf.logs)
+		rf.logs = append(rf.logs, Log{Command: command, Term: term, Index: index})
+		rf.nextIndex[rf.me] = index + 1
+		fmt.Printf("%d start agreement on command %d on index %d\n", rf.me, command.(int), index)
+		rf.mu.Unlock()
+	}
 	return index, term, isLeader
 }
 
@@ -324,13 +366,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 所有服务器上持久存在的
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.logs = make([]Log, 0)
+	rf.logs = make([]Log, 1)
 	// 所有服务器上经常变的
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	// 在领导人里经常变的(选举后重新初始化)
-    rf.nextIndex = make([]int, len(peers))
-    rf.matchIndex = make([]int, len(peers))
+	rf.nextIndex = make([]int, len(peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = 1
+	}
+	rf.matchIndex = make([]int, len(peers))
+	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.raftLoop()
@@ -413,64 +459,109 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) broadcastVoteReq() {
-	args := RequestVoteArgs {
-		Term:          rf.currentTerm,
-		CandidateId:   rf.me,
-		LastLogIndex:  len(rf.logs) - 1,
-	}
-	if len(rf.logs) > 0 {
-		args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
-	}
-	
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 
-		go func(server int, args RequestVoteArgs) {
+		go func(server int) {
+			rf.mu.Lock()
+			args := RequestVoteArgs {
+				Term:          rf.currentTerm,
+				CandidateId:   rf.me,
+				LastLogIndex:  len(rf.logs) - 1,
+			}
+			args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
+			rf.mu.Unlock()
+
 			var reply RequestVoteReply
 			if rf.sendRequestVote(server, &args, &reply) {
+				rf.mu.Lock()
 				if reply.VoteGranted && rf.state == Candidate {
-					rf.mu.Lock()
 					rf.votes++
 					if rf.votes > len(rf.peers)/2 {
 						rf.convertTo(Leader)
 						fmt.Printf("Term %d: %d is the new leader\n", rf.currentTerm, rf.me)
 					}
-					rf.mu.Unlock()
 				} else if reply.Term > rf.currentTerm {
-					rf.mu.Lock()
-					rf.currentTerm = reply.Term
-					rf.convertTo(Follower)
-					rf.mu.Unlock()
-				}
-			}
-		}(i, args)
-	}
-}
-
-func (rf *Raft) broadcastHeartbeat() {
-	args := AppendEntriesArgs {
-		Term:         	rf.currentTerm,
-		LeaderId:     	rf.me,
-		LeaderCommit: 	rf.commitIndex,
-	}
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-
-		go func(server int, args AppendEntriesArgs) {
-			var reply AppendEntriesReply
-			if rf.sendAppendEntries(server, &args, &reply) {
-				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.convertTo(Follower)
 				}
 				rf.mu.Unlock()
 			}
-		}(i, args)
+		}(i)
+	}
+}
+
+func (rf *Raft) broadcastHeartbeat() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			rf.mu.Lock()
+			args := AppendEntriesArgs {
+				Term:         	rf.currentTerm,
+				LeaderId:     	rf.me,
+				LeaderCommit: 	rf.commitIndex,
+			}
+			prevLogIndex := rf.nextIndex[server] - 1
+			args.PrevLogIndex = prevLogIndex
+			if prevLogIndex > 0 {
+				args.PrevLogTerm = rf.logs[prevLogIndex].Term
+			}
+			args.Entries = rf.logs[rf.nextIndex[server]:]
+			rf.mu.Unlock()
+
+			var reply AppendEntriesReply
+			if rf.sendAppendEntries(server, &args, &reply) {
+				rf.mu.Lock()
+				if reply.Success {
+					rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+					rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+					for i := len(rf.logs) - 1; i > rf.commitIndex; i-- {
+						count := 1
+						for _, matchIndex := range rf.matchIndex {
+							if matchIndex >= i {
+								count += 1
+							}
+						}
+
+						if count > len(rf.peers)/2 {
+							rf.commitIndex = i
+							rf.apply()
+							break
+						}
+					}
+				} else {
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.convertTo(Follower)
+					} else {
+						rf.nextIndex[server] -= 1
+					}
+				}
+				rf.mu.Unlock()
+			}
+		}(i)
+	}
+}
+
+// apply should be called after commitIndex updated
+func (rf *Raft) apply() {
+	if rf.commitIndex > rf.lastApplied {
+		go func() {
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				entry := rf.logs[i]
+				fmt.Printf("%d applies command %d on index %d\n", rf.me, entry.Command.(int), i)
+				var applyMsg ApplyMsg
+				applyMsg.CommandValid = true
+				applyMsg.Command = entry.Command
+				applyMsg.CommandIndex = i
+				rf.applyCh <- applyMsg
+			}
+		}()
 	}
 }
