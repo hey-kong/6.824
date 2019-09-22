@@ -35,9 +35,9 @@ const (
 )
 
 const (
-	HEARTBEAT_TIME	= 60 * time.Millisecond
-	ELEC_TIME_LOWER	= 300 * time.Millisecond
-	ELEC_TIME_UPPER	= 420 * time.Millisecond
+	HEARTBEAT_TIME	= time.Duration(50) * time.Millisecond
+	ELEC_TIME_LOWER	= time.Duration(150) * time.Millisecond
+	ELEC_TIME_UPPER	= time.Duration(300) * time.Millisecond
 )
 
 //
@@ -178,25 +178,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.resetElectionTimer()		// 收到投票请求时需要重置选举时间
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
-	if args.Term == rf.currentTerm {
-		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogIndex >= len(rf.logs) {
-			reply.VoteGranted = true
-			rf.votedFor = args.CandidateId;
-		} else {
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = false
-		}
+	if args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		// 已经投过票
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 		return
 	}
-	
-	rf.convertTo(Follower)
-	rf.currentTerm = args.Term
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.convertTo(Follower)
+	}
+
+	lastLogIndex := len(rf.logs) - 1
+	if args.LastLogTerm < rf.logs[lastLogIndex].Term ||
+		(args.LastLogTerm == rf.logs[lastLogIndex].Term && args.LastLogIndex < lastLogIndex) {
+		// 比候选人的日志新
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
 	rf.votedFor = args.CandidateId
+	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
 }
 
@@ -218,13 +228,20 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.resetElectionTimer()		// 收到心跳包时需要重置选举时间
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	if len(rf.logs) < args.PrevLogIndex || (args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.convertTo(Follower)
+	}
+
+	if len(rf.logs) - 1 < args.PrevLogIndex || 
+		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -256,8 +273,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.apply()
 	}
 
-	rf.convertTo(Follower)
-	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm
 	reply.Success = true
 }
 
@@ -326,7 +342,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = len(rf.logs)
 		rf.logs = append(rf.logs, Log{Command: command, Term: term, Index: index})
 		rf.nextIndex[rf.me] = index + 1
-		fmt.Printf("%d start agreement on command %d on index %d\n", rf.me, command.(int), index)
+		rf.matchIndex[rf.me] = index
+		//fmt.Printf("%d start agreement on command %d on index %d\n", rf.me, command.(int), index)
 		rf.mu.Unlock()
 	}
 	return index, term, isLeader
@@ -373,13 +390,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 在领导人里经常变的(选举后重新初始化)
 	rf.nextIndex = make([]int, len(peers))
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = 1
+		rf.nextIndex[i] = len(rf.logs)
 	}
 	rf.matchIndex = make([]int, len(peers))
 	rf.applyCh = applyCh
+	go rf.raftLoop()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	go rf.raftLoop()
 	return rf
 }
 
@@ -400,29 +417,22 @@ func (rf *Raft) raftLoop() {
 	rf.electionTimer = time.NewTimer(randTimeDuration(ELEC_TIME_LOWER, ELEC_TIME_UPPER))
 	rf.heartbeatTimer = time.NewTimer(HEARTBEAT_TIME)
 	for {
-		switch rf.state {
-		case Follower:
-			select {
-			case <-rf.electionTimer.C:
-				rf.mu.Lock()
+		select {
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
+			if rf.state == Follower {
 				rf.convertTo(Candidate)
-				rf.mu.Unlock()
-			}
-		case Candidate:
-			select {
-			case <-rf.electionTimer.C:
-				rf.mu.Lock()
+			} else {
 				rf.startElection()
-				rf.mu.Unlock()
 			}
-		case Leader:
-			select {
-			case <-rf.heartbeatTimer.C:
-				rf.mu.Lock()
+			rf.mu.Unlock()
+		case <-rf.heartbeatTimer.C:
+			rf.mu.Lock()
+			if rf.state == Leader {
 				rf.broadcastHeartbeat()
 				rf.resetHeartbeatTimer()
-				rf.mu.Unlock()
 			}
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -441,6 +451,12 @@ func (rf *Raft) convertTo(state int) {
 	case Candidate:
 		rf.startElection()
 	case Leader:
+		for i := range rf.nextIndex {
+			rf.nextIndex[i] = len(rf.logs)
+		}
+		for i := range rf.matchIndex {
+			rf.matchIndex[i] = 0
+		}
 		rf.electionTimer.Stop()
 		rf.broadcastHeartbeat()
 		rf.resetHeartbeatTimer()
@@ -450,8 +466,8 @@ func (rf *Raft) convertTo(state int) {
 }
 
 func (rf *Raft) startElection() {
-	rf.resetElectionTimer()
 	rf.currentTerm++
+	rf.resetElectionTimer()
 	rf.votedFor = rf.me
 	rf.votes = 1
 	
@@ -481,7 +497,7 @@ func (rf *Raft) broadcastVoteReq() {
 					rf.votes++
 					if rf.votes > len(rf.peers)/2 {
 						rf.convertTo(Leader)
-						fmt.Printf("Term %d: %d is the new leader\n", rf.currentTerm, rf.me)
+						//fmt.Printf("Term %d: %d is the new leader\n", rf.currentTerm, rf.me)
 					}
 				} else if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
@@ -501,17 +517,20 @@ func (rf *Raft) broadcastHeartbeat() {
 
 		go func(server int) {
 			rf.mu.Lock()
-			args := AppendEntriesArgs {
-				Term:         	rf.currentTerm,
-				LeaderId:     	rf.me,
-				LeaderCommit: 	rf.commitIndex,
+			if rf.state != Leader {
+				rf.mu.Unlock()
+				return
 			}
+
 			prevLogIndex := rf.nextIndex[server] - 1
-			args.PrevLogIndex = prevLogIndex
-			if prevLogIndex > 0 {
-				args.PrevLogTerm = rf.logs[prevLogIndex].Term
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  rf.logs[prevLogIndex].Term,
+				Entries:   rf.logs[rf.nextIndex[server]:],
+				LeaderCommit: rf.commitIndex,
 			}
-			args.Entries = rf.logs[rf.nextIndex[server]:]
 			rf.mu.Unlock()
 
 			var reply AppendEntriesReply
@@ -522,7 +541,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					rf.nextIndex[server] = rf.matchIndex[server] + 1
 
 					for i := len(rf.logs) - 1; i > rf.commitIndex; i-- {
-						count := 1
+						count := 0
 						for _, matchIndex := range rf.matchIndex {
 							if matchIndex >= i {
 								count += 1
@@ -555,12 +574,15 @@ func (rf *Raft) apply() {
 		go func() {
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				entry := rf.logs[i]
-				fmt.Printf("%d applies command %d on index %d\n", rf.me, entry.Command.(int), i)
+				//fmt.Printf("%d applies command %d on index %d\n", rf.me, entry.Command.(int), i)
 				var applyMsg ApplyMsg
 				applyMsg.CommandValid = true
 				applyMsg.Command = entry.Command
 				applyMsg.CommandIndex = i
 				rf.applyCh <- applyMsg
+				rf.mu.Lock()
+				rf.lastApplied = applyMsg.CommandIndex
+				rf.mu.Unlock()
 			}
 		}()
 	}
