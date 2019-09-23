@@ -135,6 +135,7 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
+	//fmt.Printf("%d readPersist\n", rf.me)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -160,7 +161,6 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&logs) != nil {
 			fmt.Errorf("[readPersist]: Decode Error!\n")
-			return
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
@@ -200,7 +200,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.resetElectionTimer()		// 收到投票请求时需要重置选举时间
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -229,8 +228,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.votedFor = args.CandidateId
+	rf.persist()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+
+	// 投票后需要重置选举时间
+	rf.resetElectionTimer()
 }
 
 
@@ -251,13 +254,15 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.resetElectionTimer()		// 收到心跳包时需要重置选举时间
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
+	// 收到Leader心跳包后需要重置选举时间
+	rf.resetElectionTimer()
+	
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertTo(Follower)
@@ -495,29 +500,29 @@ func (rf *Raft) convertTo(state int) {
 
 func (rf *Raft) startElection() {
 	rf.currentTerm++
-	rf.resetElectionTimer()
 	rf.votedFor = rf.me
-	rf.votes = 1
 	rf.persist()
+	rf.votes = 1
+	rf.resetElectionTimer()
+
 	rf.broadcastVoteReq()
 }
 
 func (rf *Raft) broadcastVoteReq() {
+	lastLogIndex := len(rf.logs) - 1
+	args := RequestVoteArgs {
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  rf.logs[lastLogIndex].Term,
+	}
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 
 		go func(server int) {
-			rf.mu.Lock()
-			args := RequestVoteArgs {
-				Term:          rf.currentTerm,
-				CandidateId:   rf.me,
-				LastLogIndex:  len(rf.logs) - 1,
-			}
-			args.LastLogTerm = rf.logs[len(rf.logs)-1].Term
-			rf.mu.Unlock()
-
 			var reply RequestVoteReply
 			if rf.sendRequestVote(server, &args, &reply) {
 				rf.mu.Lock()
