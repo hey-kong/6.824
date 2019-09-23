@@ -25,8 +25,8 @@ import (
 	"math/rand"
 )
 
-// import "bytes"
-// import "labgob"
+import "bytes"
+import "labgob"
 
 const (
 	Follower	= iota
@@ -121,6 +121,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -144,6 +151,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []Log
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+			fmt.Errorf("[readPersist]: Decode Error!\n")
+			return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
 }
 
 
@@ -194,6 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertTo(Follower)
+		rf.persist()
 	}
 
 	lastLogIndex := len(rf.logs) - 1
@@ -238,6 +261,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertTo(Follower)
+		rf.persist()
 	}
 
 	if len(rf.logs) - 1 < args.PrevLogIndex || 
@@ -261,6 +285,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if !isMatched {
 		rf.logs = rf.logs[:args.PrevLogIndex+1]
 		rf.logs = append(rf.logs, args.Entries...)
+		rf.persist()
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -341,6 +366,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Lock()
 		index = len(rf.logs)
 		rf.logs = append(rf.logs, Log{Command: command, Term: term, Index: index})
+		rf.persist()
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
 		//fmt.Printf("%d start agreement on command %d on index %d\n", rf.me, command.(int), index)
@@ -396,7 +422,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	go rf.raftLoop()
 	// initialize from state persisted before a crash
+	rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Unlock()
 	return rf
 }
 
@@ -470,7 +498,7 @@ func (rf *Raft) startElection() {
 	rf.resetElectionTimer()
 	rf.votedFor = rf.me
 	rf.votes = 1
-	
+	rf.persist()
 	rf.broadcastVoteReq()
 }
 
@@ -502,6 +530,7 @@ func (rf *Raft) broadcastVoteReq() {
 				} else if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.convertTo(Follower)
+					rf.persist()
 				}
 				rf.mu.Unlock()
 			}
@@ -524,12 +553,12 @@ func (rf *Raft) broadcastHeartbeat() {
 
 			prevLogIndex := rf.nextIndex[server] - 1
 			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  rf.logs[prevLogIndex].Term,
-				Entries:   rf.logs[rf.nextIndex[server]:],
-				LeaderCommit: rf.commitIndex,
+				Term:         	rf.currentTerm,
+				LeaderId:     	rf.me,
+				PrevLogIndex: 	prevLogIndex,
+				PrevLogTerm:  	rf.logs[prevLogIndex].Term,
+				Entries:   		rf.logs[rf.nextIndex[server]:],
+				LeaderCommit: 	rf.commitIndex,
 			}
 			rf.mu.Unlock()
 
@@ -558,6 +587,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.convertTo(Follower)
+						rf.persist()
 					} else {
 						rf.nextIndex[server] -= 1
 					}
