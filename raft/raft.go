@@ -78,7 +78,7 @@ type Raft struct {
 	state			int
 	votes			int
 	electionTimer	*time.Timer
-    heartbeatTimer	*time.Timer
+	heartbeatTimer	*time.Timer
 	// 所有服务器上持久存在的
 	currentTerm	int
 	votedFor	int
@@ -87,7 +87,7 @@ type Raft struct {
 	commitIndex	int	// 已经被大多数节点保存的日志的位置
 	lastApplied	int	// 被应用到状态机的日志的位置
 	// 在领导人里经常变的(选举后重新初始化)
-    nextIndex		[]int	// 每个peer都有一个值，是leader要发送给其他peer的下一个日志索引
+	nextIndex		[]int	// 每个peer都有一个值，是leader要发送给其他peer的下一个日志索引
 	matchIndex		[]int	// 每个peer都有一个值，是leader收到的其他peer已经复制给它的日志的最高索引值
 	
 	applyCh			chan ApplyMsg
@@ -135,7 +135,6 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	//fmt.Printf("%d readPersist\n", rf.me)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -178,9 +177,9 @@ func (rf *Raft) readPersist(data []byte) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term			int
-    CandidateId		int
-    LastLogIndex	int
-    LastLogTerm		int
+	CandidateId		int
+	LastLogIndex	int
+	LastLogTerm		int
 }
 
 //
@@ -190,7 +189,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term		int
-    VoteGranted	bool
+	VoteGranted	bool
 }
 
 //
@@ -249,6 +248,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term		int 
 	Success		bool
+	// optimization: for "unreliable" passed
+	ConflictTerm	int
+	ConflictIndex 	int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -269,27 +271,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.persist()
 	}
 
-	if len(rf.logs) - 1 < args.PrevLogIndex || 
-		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.logs) - 1 < args.PrevLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = -1
 		return
 	}
 
-	isMatched := true
-	if len(args.Entries) > 0 {
-		if len(rf.logs) == args.PrevLogIndex+1 {
-			// 可能会缺少一些日志条目
-			isMatched = false
-		} else if rf.logs[args.PrevLogIndex+1].Term != args.Entries[0].Term {
-			// 可能会有一些未被提交的日志条目
-			isMatched = false
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+
+		conflictIndex := args.PrevLogIndex
+		for rf.logs[conflictIndex-1].Term == reply.ConflictTerm {
+			conflictIndex--
 		}
+		reply.ConflictIndex = conflictIndex
+		return
 	}
 
-	if !isMatched {
-		rf.logs = rf.logs[:args.PrevLogIndex+1]
-		rf.logs = append(rf.logs, args.Entries...)
+	unmatchedStart := -1
+	for i := range args.Entries {
+		if len(rf.logs) <= args.PrevLogIndex+1+i ||
+			rf.logs[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
+			unmatchedStart = i
+			break
+		}
+	}
+	if unmatchedStart != -1 {
+		rf.logs = rf.logs[:args.PrevLogIndex+1+unmatchedStart]
+		rf.logs = append(rf.logs, args.Entries[unmatchedStart:]...)
 		rf.persist()
 	}
 
@@ -374,7 +387,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
-		//fmt.Printf("%d start agreement on command %d on index %d\n", rf.me, command.(int), index)
+		//fmt.Printf("%d start agreement on command %d on index %d(Term: %d)\n", rf.me, command.(int), index, rf.currentTerm)
+		rf.broadcastHeartbeat()
 		rf.mu.Unlock()
 	}
 	return index, term, isLeader
@@ -557,12 +571,14 @@ func (rf *Raft) broadcastHeartbeat() {
 			}
 
 			prevLogIndex := rf.nextIndex[server] - 1
+			entries := make([]Log, len(rf.logs[prevLogIndex+1:]))
+			copy(entries, rf.logs[prevLogIndex+1:])
 			args := AppendEntriesArgs{
 				Term:         	rf.currentTerm,
 				LeaderId:     	rf.me,
 				PrevLogIndex: 	prevLogIndex,
 				PrevLogTerm:  	rf.logs[prevLogIndex].Term,
-				Entries:   		rf.logs[rf.nextIndex[server]:],
+				Entries:   		entries,
 				LeaderCommit: 	rf.commitIndex,
 			}
 			rf.mu.Unlock()
@@ -594,7 +610,16 @@ func (rf *Raft) broadcastHeartbeat() {
 						rf.convertTo(Follower)
 						rf.persist()
 					} else {
-						rf.nextIndex[server] -= 1
+						rf.nextIndex[server] = reply.ConflictIndex
+
+						if reply.ConflictTerm != -1 {
+							for i := args.PrevLogIndex; i >= 1; i-- {
+								if rf.logs[i-1].Term == reply.ConflictTerm {
+									rf.nextIndex[server] = i
+									break
+								}
+							}
+						}
 					}
 				}
 				rf.mu.Unlock()
