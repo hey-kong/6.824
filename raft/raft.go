@@ -35,9 +35,10 @@ const (
 )
 
 const (
-	HEARTBEAT_TIME	= time.Duration(50) * time.Millisecond
-	ELEC_TIME_LOWER	= time.Duration(150) * time.Millisecond
-	ELEC_TIME_UPPER	= time.Duration(300) * time.Millisecond
+	// the tester limits to 10 heartbeats per second
+	HEARTBEAT_TIME	= time.Duration(150) * time.Millisecond
+	ELEC_TIME_LOWER	= time.Duration(450) * time.Millisecond
+	ELEC_TIME_UPPER	= time.Duration(600) * time.Millisecond
 )
 
 //
