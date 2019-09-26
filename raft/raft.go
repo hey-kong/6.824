@@ -76,22 +76,22 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state			int
-	votes			int
-	electionTimer	*time.Timer
-	heartbeatTimer	*time.Timer
+	state				int
+	votes				int
+	electionTimer		*time.Timer
+	heartbeatTimer		*time.Timer
 	// 所有服务器上持久存在的
-	currentTerm	int
-	votedFor	int
-	logs		[]Log
+	currentTerm			int
+	votedFor			int
+	logs				[]Log
 	// 所有服务器上经常变的
-	commitIndex	int	// 已经被大多数节点保存的日志的位置
-	lastApplied	int	// 被应用到状态机的日志的位置
+	commitIndex			int	// 已经被大多数节点保存的日志的位置
+	lastApplied			int	// 被应用到状态机的日志的位置
 	// 在领导人里经常变的(选举后重新初始化)
-	nextIndex		[]int	// 每个peer都有一个值，是leader要发送给其他peer的下一个日志索引
-	matchIndex		[]int	// 每个peer都有一个值，是leader收到的其他peer已经复制给它的日志的最高索引值
+	nextIndex			[]int	// 每个peer都有一个值，是leader要发送给其他peer的下一个日志索引
+	matchIndex			[]int	// 每个peer都有一个值，是leader收到的其他peer已经复制给它的日志的最高索引值
 	
-	applyCh			chan ApplyMsg
+	applyCh				chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -177,10 +177,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term			int
-	CandidateId		int
-	LastLogIndex	int
-	LastLogTerm		int
+	Term				int
+	CandidateId			int
+	LastLogIndex		int
+	LastLogTerm			int
 }
 
 //
@@ -295,7 +295,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	unmatchedStart := -1
 	for i := range args.Entries {
-		if len(rf.logs) <= args.PrevLogIndex+1+i ||
+		if len(rf.logs) == args.PrevLogIndex+1+i ||
 			rf.logs[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
 			unmatchedStart = i
 			break
