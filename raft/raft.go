@@ -314,7 +314,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = lastLogIndex
 		}
-		rf.apply()
+		rf.applyTo(rf.commitIndex)
 	}
 
 	reply.Term = rf.currentTerm
@@ -462,8 +462,10 @@ func (rf *Raft) resetHeartbeatTimer() {
 }
 
 func (rf *Raft) raftLoop() {
+	rf.mu.Lock()
 	rf.electionTimer = time.NewTimer(randTimeDuration(ELEC_TIME_LOWER, ELEC_TIME_UPPER))
 	rf.heartbeatTimer = time.NewTimer(HEARTBEAT_TIME)
+	rf.mu.Unlock()
 	for {
 		select {
 		case <-rf.electionTimer.C:
@@ -601,7 +603,7 @@ func (rf *Raft) broadcastHeartbeat() {
 
 						if count > len(rf.peers)/2 {
 							rf.commitIndex = i
-							rf.apply()
+							rf.applyTo(rf.commitIndex)
 							break
 						}
 					}
@@ -629,22 +631,20 @@ func (rf *Raft) broadcastHeartbeat() {
 	}
 }
 
-// apply should be called after commitIndex updated
-func (rf *Raft) apply() {
-	if rf.commitIndex > rf.lastApplied {
-		go func() {
-			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				entry := rf.logs[i]
-				//fmt.Printf("%d applies command %d on index %d\n", rf.me, entry.Command.(int), i)
+// applyTo should be called after commitIndex updated
+func (rf *Raft) applyTo(commitIndex int) {
+	if commitIndex > rf.lastApplied {
+		go func(start int, entries []Log) {
+			for i, entry := range entries {
 				var applyMsg ApplyMsg
 				applyMsg.CommandValid = true
 				applyMsg.Command = entry.Command
-				applyMsg.CommandIndex = i
+				applyMsg.CommandIndex = start + i
 				rf.applyCh <- applyMsg
 				rf.mu.Lock()
 				rf.lastApplied = applyMsg.CommandIndex
 				rf.mu.Unlock()
 			}
-		}()
+		}(rf.lastApplied+1, rf.logs[rf.lastApplied+1:rf.commitIndex+1])
 	}
 }
