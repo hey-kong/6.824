@@ -1,9 +1,9 @@
 package mapreduce
 
 import (
-	"os"
-	"io/ioutil"
 	"encoding/json"
+	"io/ioutil"
+	"os"
 )
 
 func doReduce(
@@ -51,37 +51,37 @@ func doReduce(
 	// Your code here (Part I).
 	//
 	allKeyValues := make([]KeyValue, 0)
-    for mapTask := 0; mapTask < nMap; mapTask++ {
-        fileName := reduceName(jobName, mapTask, reduceTask)
-        taskJson, err := ioutil.ReadFile(fileName)
-        if err != nil {
-            panic(err)
-        }
-        curKvs := make([]KeyValue, 0)
-        if err = json.Unmarshal(taskJson, &curKvs); err != nil {
-            panic(err)
-        }
-        for _, kv := range curKvs {
-            allKeyValues = append(allKeyValues, kv)
-        }
-    }
+	for mapTask := 0; mapTask < nMap; mapTask++ {
+		fileName := reduceName(jobName, mapTask, reduceTask)
+		taskJson, err := ioutil.ReadFile(fileName)
+		if err != nil {
+			panic(err)
+		}
+		curKvs := make([]KeyValue, 0)
+		if err = json.Unmarshal(taskJson, &curKvs); err != nil {
+			panic(err)
+		}
+		for _, kv := range curKvs {
+			allKeyValues = append(allKeyValues, kv)
+		}
+	}
 
-    multiValueMap := make(map[string][]string)
-    for _, kv := range allKeyValues {
-        k, v := kv.Key, kv.Value
-        multiValueMap[k] = append(multiValueMap[k], v)
-    }
+	multiValueMap := make(map[string][]string)
+	for _, kv := range allKeyValues {
+		k, v := kv.Key, kv.Value
+		multiValueMap[k] = append(multiValueMap[k], v)
+	}
 
-    file, err := os.Create(outFile)
-    if err != nil {
-        panic(err)
+	file, err := os.Create(outFile)
+	if err != nil {
+		panic(err)
 	}
 	defer file.Close()
 
-    enc := json.NewEncoder(file)
-    for k, v := range multiValueMap {
-        if err := enc.Encode(KeyValue{k, reduceF(k, v)}); err != nil {
-            panic(err)
-        }
-    }
+	enc := json.NewEncoder(file)
+	for k, v := range multiValueMap {
+		if err := enc.Encode(KeyValue{k, reduceF(k, v)}); err != nil {
+			panic(err)
+		}
+	}
 }

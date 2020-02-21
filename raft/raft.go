@@ -18,27 +18,27 @@ package raft
 //
 
 import (
-	"sync"
-	"labrpc"
-	"time"
 	"fmt"
+	"labrpc"
 	"math/rand"
+	"sync"
+	"time"
 )
 
 import "bytes"
 import "labgob"
 
 const (
-	Follower	= iota
+	Follower = iota
 	Candidate
 	Leader
 )
 
 const (
 	// the tester limits to 10 heartbeats per second
-	HEARTBEAT_TIME	= time.Duration(150) * time.Millisecond
-	ELEC_TIME_LOWER	= time.Duration(450) * time.Millisecond
-	ELEC_TIME_UPPER	= time.Duration(600) * time.Millisecond
+	HEARTBEAT_TIME  = time.Duration(150) * time.Millisecond
+	ELEC_TIME_LOWER = time.Duration(450) * time.Millisecond
+	ELEC_TIME_UPPER = time.Duration(600) * time.Millisecond
 )
 
 //
@@ -59,9 +59,9 @@ type ApplyMsg struct {
 }
 
 type Log struct {
-	Command	interface{}
-	Index	int
-	Term	int
+	Command interface{}
+	Index   int
+	Term    int
 }
 
 //
@@ -76,22 +76,22 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state				int
-	votes				int
-	electionTimer		*time.Timer
-	heartbeatTimer		*time.Timer
+	state          int
+	votes          int
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
 	// 所有服务器上持久存在的
-	currentTerm			int
-	votedFor			int
-	logs				[]Log
+	currentTerm int
+	votedFor    int
+	logs        []Log
 	// 所有服务器上经常变的
-	commitIndex			int	// 已经被大多数节点保存的日志的位置
-	lastApplied			int	// 被应用到状态机的日志的位置
+	commitIndex int // 已经被大多数节点保存的日志的位置
+	lastApplied int // 被应用到状态机的日志的位置
 	// 在领导人里经常变的(选举后重新初始化)
-	nextIndex			[]int	// 每个peer都有一个值，是leader要发送给其他peer的下一个日志索引
-	matchIndex			[]int	// 每个peer都有一个值，是leader收到的其他peer已经复制给它的日志的最高索引值
-	
-	applyCh				chan ApplyMsg
+	nextIndex  []int // 每个peer都有一个值，是leader要发送给其他peer的下一个日志索引
+	matchIndex []int // 每个peer都有一个值，是leader收到的其他peer已经复制给它的日志的最高索引值
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -106,7 +106,6 @@ func (rf *Raft) GetState() (int, bool) {
 	isleader = (rf.state == Leader)
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -130,7 +129,6 @@ func (rf *Raft) persist() {
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -160,7 +158,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&logs) != nil {
-			fmt.Errorf("[readPersist]: Decode Error!\n")
+		fmt.Errorf("[readPersist]: Decode Error!\n")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
@@ -168,19 +166,16 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term				int
-	CandidateId			int
-	LastLogIndex		int
-	LastLogTerm			int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -189,8 +184,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term		int
-	VoteGranted	bool
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -236,22 +231,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.resetElectionTimer()
 }
 
-
 type AppendEntriesArgs struct {
-	Term         	int  	// leader's term
-	LeaderId     	int  	// so follower can redirect clients
-	PrevLogIndex 	int  	// index of log entry immediately preceding new ones
-	PrevLogTerm  	int  	// term of prevLogIndex entry
-	Entries      	[]Log  	// (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommit 	int    	// leader's commitIndex
+	Term         int   // leader's term
+	LeaderId     int   // so follower can redirect clients
+	PrevLogIndex int   // index of log entry immediately preceding new ones
+	PrevLogTerm  int   // term of prevLogIndex entry
+	Entries      []Log // (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int   // leader's commitIndex
 }
 
 type AppendEntriesReply struct {
-	Term		int 
-	Success		bool
+	Term    int
+	Success bool
 	// optimization: for "unreliable" passed
-	ConflictTerm	int
-	ConflictIndex 	int
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -265,14 +259,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 收到Leader心跳包后需要重置选举时间
 	rf.resetElectionTimer()
-	
+
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.convertTo(Follower)
 		rf.persist()
 	}
 
-	if len(rf.logs) - 1 < args.PrevLogIndex {
+	if len(rf.logs)-1 < args.PrevLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.ConflictIndex = len(rf.logs)
@@ -449,7 +443,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func randTimeDuration(lower, upper time.Duration) time.Duration {
-	d := rand.Int63n(upper.Nanoseconds() - lower.Nanoseconds()) + lower.Nanoseconds()
+	d := rand.Int63n(upper.Nanoseconds()-lower.Nanoseconds()) + lower.Nanoseconds()
 	return time.Duration(d) * time.Nanosecond
 }
 
@@ -527,7 +521,7 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) broadcastVoteReq() {
 	lastLogIndex := len(rf.logs) - 1
-	args := RequestVoteArgs {
+	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: lastLogIndex,
@@ -577,12 +571,12 @@ func (rf *Raft) broadcastHeartbeat() {
 			entries := make([]Log, len(rf.logs[prevLogIndex+1:]))
 			copy(entries, rf.logs[prevLogIndex+1:])
 			args := AppendEntriesArgs{
-				Term:         	rf.currentTerm,
-				LeaderId:     	rf.me,
-				PrevLogIndex: 	prevLogIndex,
-				PrevLogTerm:  	rf.logs[prevLogIndex].Term,
-				Entries:   		entries,
-				LeaderCommit: 	rf.commitIndex,
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  rf.logs[prevLogIndex].Term,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
 			}
 			rf.mu.Unlock()
 
