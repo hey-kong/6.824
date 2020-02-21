@@ -18,15 +18,15 @@ package raft
 //
 
 import (
+	"6.824/labrpc"
 	"fmt"
-	"labrpc"
 	"math/rand"
 	"sync"
 	"time"
 )
 
 import "bytes"
-import "labgob"
+import "6.824/labgob"
 
 const (
 	Follower = iota
