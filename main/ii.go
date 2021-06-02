@@ -2,11 +2,12 @@ package main
 
 import (
 	"fmt"
-	"mapreduce"
 	"os"
 	"strconv"
 	"strings"
 	"unicode"
+
+	"6.824/mapreduce"
 )
 
 // The mapping function is called once for each piece of the input.

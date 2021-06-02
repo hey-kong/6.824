@@ -1,20 +1,21 @@
 package raftkv
 
-import "labrpc"
-import "testing"
-import "os"
+import (
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"math/rand"
+	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
 
-// import "log"
-import crand "crypto/rand"
-import "math/big"
-import "math/rand"
-import "encoding/base64"
-import "sync"
-import "runtime"
-import "raft"
-import "fmt"
-import "time"
-import "sync/atomic"
+	"6.824/labrpc"
+	"6.824/raft"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)

@@ -1,16 +1,15 @@
 package mapreduce
 
 import (
-	"fmt"
-	"testing"
-	"time"
-
 	"bufio"
+	"fmt"
 	"log"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"testing"
+	"time"
 )
 
 const (

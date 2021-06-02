@@ -1,12 +1,11 @@
 package shardmaster
 
 import (
+	"fmt"
 	"sync"
 	"testing"
+	// "time"
 )
-
-// import "time"
-import "fmt"
 
 func check(t *testing.T, groups []int, ck *Clerk) {
 	c := ck.Query(-1)
