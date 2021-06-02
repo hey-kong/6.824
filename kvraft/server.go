@@ -22,6 +22,16 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key   string
+	Value string
+	Op    string // "Get", "Put" or "Append"
+	Cid   int64  // client ID
+	Seq   int    // request sequence number
+}
+
+type LatestReply struct {
+	seq   int      // latest request
+	reply GetReply // latest reply
 }
 
 type KVServer struct {
@@ -33,14 +43,123 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db        map[string]string      // 保存键值对
+	notify    map[int]chan struct{}  // 每条log对于一个channel，在server上先写log再reply
+	duplicate map[int64]*LatestReply // 检测请求是否重复
+
+	shutdown chan struct{} // shutdown chan
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// 如果不是leader，直接返回
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.WrongLeader = true
+		reply.Err = ""
+		return
+	}
+
+	// 防止重复处理过去的请求
+	kv.mu.Lock()
+	if latestReply, ok := kv.duplicate[args.Cid]; ok && latestReply.seq == args.Seq {
+		kv.mu.Unlock()
+		reply.WrongLeader = false
+		reply.Err = OK
+		reply.Value = latestReply.reply.Value
+		return
+	}
+
+	command := Op{
+		Key: args.Key,
+		Op:  "Get",
+		Cid: args.Cid,
+		Seq: args.Seq,
+	}
+
+	// 将command作为log entry写入日志中
+	index, startTerm, _ := kv.rf.Start(command)
+	notify := make(chan struct{})
+	kv.notify[index] = notify
+	kv.mu.Unlock()
+
+	// 等待被apply
+	select {
+	case <-kv.shutdown:
+		DPrintf("Peer[%d]: shutdown - Get", kv.me)
+		return
+	case <-notify:
+		curTerm, isLeader := kv.rf.GetState()
+		// leader发生了变化
+		if !isLeader || startTerm != curTerm {
+			reply.WrongLeader = true
+			reply.Err = ErrNotLeader
+			return
+		}
+
+		kv.mu.Lock()
+		if value, ok := kv.db[args.Key]; ok {
+			reply.WrongLeader = false
+			reply.Value = value
+			reply.Err = OK
+			DPrintf("Peer[%d]: Get request for Key[%q] Value:%s", kv.me, args.Key, value)
+		} else {
+			reply.Err = ErrNoKey
+		}
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.WrongLeader = true
+		reply.Err = ErrNotLeader
+		return
+	}
+
+	// 防止重复处理过去的请求
+	kv.mu.Lock()
+	if latestReply, ok := kv.duplicate[args.Cid]; ok && latestReply.seq == args.Seq {
+		kv.mu.Unlock()
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
+	}
+
+	command := Op{
+		Key:   args.Key,
+		Value: args.Value,
+		Op:    args.Op,
+		Cid:   args.Cid,
+		Seq:   args.Seq,
+	}
+
+	// 将command作为log entry写入日志中
+	index, startTerm, _ := kv.rf.Start(command)
+	notify := make(chan struct{})
+	kv.notify[index] = notify
+	kv.mu.Unlock()
+
+	// 等待被apply
+	select {
+	case <-kv.shutdown:
+		DPrintf("Peer[%d]: shutdown - Get", kv.me)
+		return
+	case <-notify:
+		curTerm, isLeader := kv.rf.GetState()
+		// leader发生了变化
+		if !isLeader || startTerm != curTerm {
+			reply.WrongLeader = true
+			reply.Err = ErrNotLeader
+			return
+		}
+
+		kv.mu.Lock()
+		reply.WrongLeader = false
+		reply.Err = OK
+		DPrintf("Peer[%d]: Put/Append request for Key[%q] Value[%q]", kv.me, args.Key, args.Value)
+		kv.mu.Unlock()
+	}
 }
 
 //
@@ -52,6 +171,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	close(kv.shutdown)
 }
 
 //
@@ -83,6 +203,60 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.db = make(map[string]string)
+	kv.notify = make(map[int]chan struct{})
+	kv.duplicate = make(map[int64]*LatestReply)
+
+	kv.shutdown = make(chan struct{})
+
+	go kv.applyDaemon()
 
 	return kv
+}
+
+// 后台对日志进行apply
+func (kv *KVServer) applyDaemon() {
+	for {
+		select {
+		case <-kv.shutdown:
+			DPrintf("Peer[%d]: shutdown - applyDaemon", kv.me)
+			return
+		case applyMsg, ok := <-kv.applyCh:
+			if ok && applyMsg.Command != nil && applyMsg.CommandValid {
+				command := applyMsg.Command.(Op)
+				kv.mu.Lock()
+				if dup, ok := kv.duplicate[command.Cid]; !ok || command.Seq > dup.seq {
+					switch command.Op {
+					case "Get":
+						kv.duplicate[command.Cid] = &LatestReply{
+							command.Seq,
+							GetReply{
+								Value: kv.db[command.Key],
+							},
+						}
+					case "Put":
+						kv.duplicate[command.Cid] = &LatestReply{
+							seq: command.Seq,
+						}
+						kv.db[command.Key] = command.Value
+					case "Append":
+						kv.duplicate[command.Cid] = &LatestReply{
+							seq: command.Seq,
+						}
+						kv.db[command.Key] += command.Value
+					default:
+						DPrintf("Peer[%d]: receive unknown command: %s",
+							kv.me, command.Op)
+					}
+				}
+
+				// apply后需要通知当前节点
+				if notify, ok := kv.notify[applyMsg.CommandIndex]; ok && notify != nil {
+					close(notify)
+					delete(kv.notify, applyMsg.CommandIndex)
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
 }
