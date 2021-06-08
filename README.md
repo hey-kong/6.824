@@ -10,5 +10,5 @@
     - [x] Part 3A
     - [ ] Part 3B
 - [ ] Lab 4: Sharded Key/Value Service
-    - [ ] Part 4A
+    - [x] Part 4A
     - [ ] Part 4B
