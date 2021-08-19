@@ -127,9 +127,11 @@ func (rf *Raft) broadcastHeartbeat() {
 					continue
 				}
 
-				term := 0
-				if index >= 0 {
+				var term int
+				var entries []LogEntry
+				if index < rf.logLength() {
 					term = rf.logAt(index).Term
+					entries = rf.logRange(index+1, rf.logEnd())
 				}
 
 				args := AppendEntriesArgs{
@@ -138,7 +140,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					LeaderCommit: rf.commitIndex,
 					PrevLogIndex: index,
 					PrevLogTerm:  term,
-					Entries:      rf.logRange(index+1, rf.logEnd()),
+					Entries:      entries,
 				}
 
 				go func(peer int, args AppendEntriesArgs) {
