@@ -3,6 +3,7 @@ package shardmaster
 import (
 	"log"
 	"sync"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -16,10 +17,9 @@ type ShardMaster struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
-
-	configs   []Config              // indexed by config num
-	duplicate map[int64]int         // 检测请求是否重复
-	notify    map[int]chan struct{} // 每条log对于一个channel，在server上先写log再reply
+	configs []Config        // indexed by config num
+	notify  map[int]chan Op // 每条log对于一个channel，在server上先写log再reply
+	cid2seq map[int64]int   // 检测请求是否重复
 
 	shutdown chan struct{} // shutdown chan
 }
@@ -32,198 +32,80 @@ type Op struct {
 	Seq  int
 }
 
+func equalOp(a Op, b Op) bool {
+	return a.Type == b.Type && a.Seq == b.Seq && a.Cid == b.Cid
+}
+
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
-	if _, isLeader := sm.rf.GetState(); !isLeader {
-		reply.WrongLeader = true
-		reply.Err = ErrNotLeader
-		return
-	}
-
-	// 防止重复处理过去的请求
-	sm.mu.Lock()
-	if seq, ok := sm.duplicate[args.Cid]; ok && seq == args.Seq {
-		sm.mu.Unlock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		return
-	}
-
-	command := Op{
-		Type: "Join",
-		Args: *args,
-		Cid:  args.Cid,
-		Seq:  args.Seq,
-	}
-
-	// 将command作为log entry写入日志中
-	index, startTerm, _ := sm.rf.Start(command)
-	notify := make(chan struct{})
-	sm.notify[index] = notify
-	sm.mu.Unlock()
-
-	// 等待被apply
-	select {
-	case <-sm.shutdown:
-		return
-	case <-notify:
-		curTerm, isLeader := sm.rf.GetState()
-		// leader发生了变化
-		if !isLeader || startTerm != curTerm {
-			reply.WrongLeader = true
-			reply.Err = ErrNotLeader
-			return
-		}
-
-		sm.mu.Lock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		sm.mu.Unlock()
-	}
+	command := Op{"Join", *args, args.Cid, args.Seq}
+	reply.WrongLeader = sm.handle(command)
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
-	if _, isLeader := sm.rf.GetState(); !isLeader {
-		reply.WrongLeader = true
-		reply.Err = ErrNotLeader
-		return
-	}
-
-	// 防止重复处理过去的请求
-	sm.mu.Lock()
-	if seq, ok := sm.duplicate[args.Cid]; ok && seq == args.Seq {
-		sm.mu.Unlock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		return
-	}
-
-	command := Op{
-		Type: "Leave",
-		Args: *args,
-		Cid:  args.Cid,
-		Seq:  args.Seq,
-	}
-
-	// 将command作为log entry写入日志中
-	index, startTerm, _ := sm.rf.Start(command)
-	notify := make(chan struct{})
-	sm.notify[index] = notify
-	sm.mu.Unlock()
-
-	// 等待被apply
-	select {
-	case <-sm.shutdown:
-		return
-	case <-notify:
-		curTerm, isLeader := sm.rf.GetState()
-		// leader发生了变化
-		if !isLeader || startTerm != curTerm {
-			reply.WrongLeader = true
-			reply.Err = ErrNotLeader
-			return
-		}
-
-		sm.mu.Lock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		sm.mu.Unlock()
-	}
+	command := Op{"Leave", *args, args.Cid, args.Seq}
+	reply.WrongLeader = sm.handle(command)
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
-	if _, isLeader := sm.rf.GetState(); !isLeader {
-		reply.WrongLeader = true
-		reply.Err = ErrNotLeader
-		return
-	}
-
-	// 防止重复处理过去的请求
-	sm.mu.Lock()
-	if seq, ok := sm.duplicate[args.Cid]; ok && seq == args.Seq {
-		sm.mu.Unlock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		return
-	}
-
-	command := Op{
-		Type: "Move",
-		Args: *args,
-		Cid:  args.Cid,
-		Seq:  args.Seq,
-	}
-
-	// 将command作为log entry写入日志中
-	index, startTerm, _ := sm.rf.Start(command)
-	notify := make(chan struct{})
-	sm.notify[index] = notify
-	sm.mu.Unlock()
-
-	// 等待被apply
-	select {
-	case <-sm.shutdown:
-		return
-	case <-notify:
-		curTerm, isLeader := sm.rf.GetState()
-		// leader发生了变化
-		if !isLeader || startTerm != curTerm {
-			reply.WrongLeader = true
-			reply.Err = ErrNotLeader
-			return
-		}
-
-		sm.mu.Lock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		sm.mu.Unlock()
-	}
+	command := Op{"Move", *args, args.Cid, args.Seq}
+	reply.WrongLeader = sm.handle(command)
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
-	if _, isLeader := sm.rf.GetState(); !isLeader {
-		reply.WrongLeader = true
-		reply.Err = ErrNotLeader
-		return
-	}
-
-	sm.mu.Lock()
-	command := Op{
-		Type: "Query",
-		Args: *args,
-	}
-
-	// 将command作为log entry写入日志中
-	index, startTerm, _ := sm.rf.Start(command)
-	notify := make(chan struct{})
-	sm.notify[index] = notify
-	sm.mu.Unlock()
-
-	// 等待被apply
-	select {
-	case <-sm.shutdown:
-		return
-	case <-notify:
-		curTerm, isLeader := sm.rf.GetState()
-		// leader发生了变化
-		if !isLeader || startTerm != curTerm {
-			reply.WrongLeader = true
-			reply.Err = ErrNotLeader
-			return
-		}
-
+	reply.WrongLeader = true
+	command := Op{"Query", *args, nrand(), -1}
+	reply.WrongLeader = sm.handle(command)
+	if !reply.WrongLeader {
 		sm.mu.Lock()
+		defer sm.mu.Unlock()
 		if args.Num >= 0 && args.Num < len(sm.configs) {
 			reply.Config = sm.configs[args.Num]
 		} else {
 			reply.Config = sm.configs[len(sm.configs)-1]
 		}
-		reply.WrongLeader = false
-		reply.Err = OK
+	}
+}
+
+func (sm *ShardMaster) handle(command Op) bool {
+	wrongLeader := true
+	index, _, isLeader := sm.rf.Start(command)
+	if !isLeader {
+		return wrongLeader
+	}
+	ch := sm.getCh(index, true)
+	op := sm.notified(ch, index)
+	if equalOp(op, command) {
+		wrongLeader = false
+	}
+	return wrongLeader
+}
+
+func (sm *ShardMaster) getCh(idx int, createIfNotExists bool) chan Op {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if _, ok := sm.notify[idx]; !ok {
+		if !createIfNotExists {
+			return nil
+		}
+		sm.notify[idx] = make(chan Op, 1)
+	}
+	return sm.notify[idx]
+}
+
+func send(notifyCh chan Op, op Op) {
+	notifyCh <- op
+}
+
+func (sm *ShardMaster) notified(ch chan Op, index int) Op {
+	select {
+	case notifyArg := <-ch:
+		close(ch)
+		sm.mu.Lock()
+		delete(sm.notify, index)
 		sm.mu.Unlock()
+		return notifyArg
+	case <-time.After(time.Duration(600) * time.Millisecond):
+		return Op{}
 	}
 }
 
@@ -370,9 +252,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 
 	// Your code here.
-	sm.notify = make(map[int]chan struct{})
-	sm.duplicate = make(map[int64]int)
-
+	sm.notify = make(map[int]chan Op)
+	sm.cid2seq = make(map[int64]int)
 	sm.shutdown = make(chan struct{})
 
 	go sm.applyDaemon()
@@ -380,30 +261,26 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	return sm
 }
 
-// 后台对日志进行apply
 func (sm *ShardMaster) applyDaemon() {
 	for {
 		select {
 		case <-sm.shutdown:
 			return
-		case applyMsg, ok := <-sm.applyCh:
-			if !ok || applyMsg.Command == nil || !applyMsg.CommandValid {
+		case applyMsg := <-sm.applyCh:
+			if !applyMsg.CommandValid {
 				continue
 			}
-
-			command := applyMsg.Command.(Op)
+			op := applyMsg.Command.(Op)
 			sm.mu.Lock()
-			if seq, ok := sm.duplicate[command.Cid]; !ok || command.Seq > seq {
-				sm.updateConfig(command.Type, command.Args)
-				sm.duplicate[command.Cid] = command.Seq
-			}
-
-			// apply后需要通知当前节点
-			if notify, ok := sm.notify[applyMsg.CommandIndex]; ok && notify != nil {
-				close(notify)
-				delete(sm.notify, applyMsg.CommandIndex)
+			maxSeq, found := sm.cid2seq[op.Cid]
+			if op.Seq >= 0 && (!found || op.Seq > maxSeq) {
+				sm.updateConfig(op.Type, op.Args)
+				sm.cid2seq[op.Cid] = op.Seq
 			}
 			sm.mu.Unlock()
+			if notifyCh := sm.getCh(applyMsg.CommandIndex, false); notifyCh != nil {
+				send(notifyCh, op)
+			}
 		}
 	}
 }

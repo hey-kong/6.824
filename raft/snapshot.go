@@ -149,7 +149,7 @@ func (rf *Raft) StartSnapshotOn(index int, snapshot []byte) {
 		return
 	}
 
-	rf.logs = rf.logRange(index, rf.logEnd())
+	rf.logs = append(make([]LogEntry, 0), rf.logRange(index, rf.logEnd())...)
 	// update new lastIncludedIndex and lastIncludedTerm
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = rf.logAt(index).Term
