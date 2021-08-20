@@ -127,11 +127,12 @@ func (rf *Raft) broadcastHeartbeat() {
 					continue
 				}
 
-				var term int
-				var entries []LogEntry
+				term := -1
+				entries := []LogEntry{}
 				if index < rf.logLength() {
 					term = rf.logAt(index).Term
-					entries = rf.logRange(index+1, rf.logEnd())
+					entries = make([]LogEntry, rf.logLength()-index-1)
+					copy(entries, rf.logRange(index+1, rf.logEnd()))
 				}
 
 				args := AppendEntriesArgs{

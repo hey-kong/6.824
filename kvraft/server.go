@@ -29,11 +29,6 @@ type Op struct {
 	Seq   int    // request sequence number
 }
 
-type LatestReply struct {
-	seq   int      // latest request
-	reply GetReply // latest reply
-}
-
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -43,9 +38,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	db        map[string]string      // 保存键值对
-	notify    map[int]chan struct{}  // 每条log对于一个channel，在server上先写log再reply
-	duplicate map[int64]*LatestReply // 检测请求是否重复
+	db        map[string]string     // 保存键值对
+	notify    map[int]chan struct{} // 每条log对于一个channel，在server上先写log再reply
+	cid2seq   map[int64]int         // 检测请求是否重复
+	persister *raft.Persister
 
 	shutdown chan struct{} // shutdown chan
 }
@@ -59,16 +55,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	// 防止重复处理过去的请求
 	kv.mu.Lock()
-	if latestReply, ok := kv.duplicate[args.Cid]; ok && latestReply.seq == args.Seq {
-		kv.mu.Unlock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		reply.Value = latestReply.reply.Value
-		return
-	}
-
 	command := Op{
 		Key: args.Key,
 		Op:  "Get",
@@ -117,15 +104,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	// 防止重复处理过去的请求
 	kv.mu.Lock()
-	if latestReply, ok := kv.duplicate[args.Cid]; ok && latestReply.seq == args.Seq {
-		kv.mu.Unlock()
-		reply.WrongLeader = false
-		reply.Err = OK
-		return
-	}
-
 	command := Op{
 		Key:   args.Key,
 		Value: args.Value,
@@ -205,9 +184,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.db = make(map[string]string)
 	kv.notify = make(map[int]chan struct{})
-	kv.duplicate = make(map[int64]*LatestReply)
+	kv.cid2seq = make(map[int64]int)
+	kv.persister = persister
 
 	kv.shutdown = make(chan struct{})
+
+	kv.decodeSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.applyDaemon()
 
@@ -222,27 +204,22 @@ func (kv *KVServer) applyDaemon() {
 			DPrintf("Peer[%d]: shutdown - applyDaemon", kv.me)
 			return
 		case applyMsg, ok := <-kv.applyCh:
+			if !applyMsg.CommandValid {
+				snapshot := applyMsg.Command.([]byte)
+				kv.decodeSnapshot(snapshot)
+				continue
+			}
 			if ok && applyMsg.Command != nil && applyMsg.CommandValid {
 				command := applyMsg.Command.(Op)
 				kv.mu.Lock()
-				if dup, ok := kv.duplicate[command.Cid]; !ok || command.Seq > dup.seq {
+				if seq, ok := kv.cid2seq[command.Cid]; !ok || command.Seq > seq {
+					kv.cid2seq[command.Cid] = command.Seq
 					switch command.Op {
 					case "Get":
-						kv.duplicate[command.Cid] = &LatestReply{
-							command.Seq,
-							GetReply{
-								Value: kv.db[command.Key],
-							},
-						}
+						// do nothing
 					case "Put":
-						kv.duplicate[command.Cid] = &LatestReply{
-							seq: command.Seq,
-						}
 						kv.db[command.Key] = command.Value
 					case "Append":
-						kv.duplicate[command.Cid] = &LatestReply{
-							seq: command.Seq,
-						}
 						kv.db[command.Key] += command.Value
 					default:
 						DPrintf("Peer[%d]: receive unknown command: %s",
@@ -255,6 +232,7 @@ func (kv *KVServer) applyDaemon() {
 					close(notify)
 					delete(kv.notify, applyMsg.CommandIndex)
 				}
+				kv.checkSnapshot(applyMsg.CommandIndex)
 				kv.mu.Unlock()
 			}
 		}

@@ -296,8 +296,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.resetTerm(0, NullPeer)
-	rf.commitIndex = rf.lastIncludedIndex
-	rf.lastApplied = rf.lastIncludedIndex
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.heartbeat = make(chan int, 100)
 	rf.granted = make(chan int, 100)
@@ -306,7 +306,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.persist()
 
 	go rf.service()
 	return rf
