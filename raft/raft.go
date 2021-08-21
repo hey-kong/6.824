@@ -20,6 +20,7 @@ package raft
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -27,16 +28,17 @@ import (
 	"6.824/labrpc"
 )
 
-type Role int
+type State int
 
 const (
-	NullPeer      = -1
-	RoleFollower  = 0
-	RoleCandidate = 1
-	RoleLeader    = 2
+	Follower  State = iota // value --> 0
+	Candidate              // value --> 1
+	Leader                 // value --> 2
 )
 
-type LogEntry struct {
+const NULL int = -1
+
+type Log struct {
 	Term    int
 	Command interface{}
 }
@@ -56,6 +58,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	SnapShot     []byte
 }
 
 //
@@ -73,9 +76,9 @@ type Raft struct {
 
 	// Persistent state on all servers
 	currentTerm int
-	currentRole Role
+	state       State
 	votedFor    int
-	logs        []LogEntry
+	logs        []Log
 
 	// Volatile state on all servers
 	commitIndex int
@@ -89,20 +92,25 @@ type Raft struct {
 	lastIncludedIndex int
 	lastIncludedTerm  int
 
-	applyCh   chan ApplyMsg
-	applyChMu sync.Mutex
-	heartbeat chan int
-	running   bool
-	granted   chan int
+	//channel
+	applyCh chan ApplyMsg // from Make()
+	killCh  chan bool     //for Kill()
+
+	//handle rpc
+	voteCh      chan bool
+	appendLogCh chan bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	// Your code here (2A).
+	var term int
+	var isleader bool
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.currentTerm, rf.currentRole == RoleLeader
+	term = rf.currentTerm
+	isleader = (rf.state == Leader)
+	return term, isleader
 }
 
 //
@@ -111,14 +119,14 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	rf.persister.SaveRaftState(rf.encodeRaftState())
+}
+
+func (rf *Raft) persistWithSnapShot(snapshot []byte) {
+	rf.persister.SaveStateAndSnapshot(rf.encodeRaftState(), snapshot)
+}
+
+func (rf *Raft) encodeRaftState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -126,8 +134,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.logs)
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	return w.Bytes()
 }
 
 //
@@ -137,40 +144,51 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
-	var votedFor int
-	var logs []LogEntry
-	var lastIncludedIndex, lastIncludedTerm int
-	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil ||
-		d.Decode(&logs) != nil ||
-		d.Decode(&lastIncludedIndex) != nil ||
-		d.Decode(&lastIncludedTerm) != nil {
+	var voteFor int
+	var logs []Log
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	if d.Decode(&currentTerm) != nil || d.Decode(&voteFor) != nil || d.Decode(&logs) != nil ||
+		d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		fmt.Errorf("[readPersist]: Decode Error!\n")
 	} else {
-		rf.currentTerm = currentTerm
-		rf.votedFor = votedFor
-		rf.logs = logs
-		rf.lastIncludedIndex = lastIncludedIndex
-		rf.lastIncludedTerm = lastIncludedTerm
-		rf.commitIndex = lastIncludedIndex
-		rf.lastApplied = lastIncludedIndex
+		rf.mu.Lock()
+		rf.currentTerm, rf.votedFor, rf.logs = currentTerm, voteFor, logs
+		rf.lastIncludedTerm, rf.lastIncludedIndex = lastIncludedTerm, lastIncludedIndex
+		rf.commitIndex, rf.lastApplied = rf.lastIncludedIndex, rf.lastIncludedIndex
+		rf.mu.Unlock()
 	}
+}
+
+func (rf *Raft) beLeader() {
+	if rf.state != Candidate {
+		return
+	}
+	rf.state = Leader
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.nextIndex); i++ {
+		rf.nextIndex[i] = rf.getLastLogIdx() + 1
+	}
+}
+
+func (rf *Raft) beCandidate() {
+	rf.state = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.persist()
+	go rf.broadcastVoteReq()
+}
+
+func (rf *Raft) beFollower(term int) {
+	rf.state = Follower
+	rf.votedFor = NULL
+	rf.currentTerm = term
+	rf.persist()
 }
 
 //
@@ -191,20 +209,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.currentRole == RoleLeader {
-		defer rf.persist()
-		rf.logs = append(rf.logs, LogEntry{rf.currentTerm, command})
-		return rf.lastIndex(), rf.currentTerm, true
-	} else {
-		DPrintf("%s Start %v Failed", rf, command)
-		return 0, 0, false
-	}
-}
 
-func (rf *Raft) resetTerm(higherTerm int, peer int) {
-	rf.currentRole = RoleFollower
-	rf.currentTerm = higherTerm
-	rf.votedFor = peer
+	index := -1
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
+
+	if isLeader {
+		index = rf.getLastLogIdx() + 1
+		newLog := Log{
+			rf.currentTerm,
+			command,
+		}
+		rf.logs = append(rf.logs, newLog)
+		rf.persist()
+		rf.broadcastHeartbeat()
+	}
+	return index, term, isLeader
 }
 
 //
@@ -215,65 +235,7 @@ func (rf *Raft) resetTerm(higherTerm int, peer int) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.running = false
-}
-
-func (rf *Raft) service() {
-	for {
-		rf.mu.Lock()
-		role := rf.currentRole
-		if !rf.running {
-			rf.mu.Unlock()
-			return
-		}
-		rf.mu.Unlock()
-
-		switch role {
-		case RoleFollower:
-			select {
-			case <-rf.granted:
-				// pass
-				DPrintf("%s receive granted", rf)
-			case <-rf.heartbeat:
-				// pass
-				DPrintf("%s receive heartbeat", rf)
-			case <-time.After(randElectTime()):
-				rf.mu.Lock()
-				DPrintf("%s no heartbeat, upgrade to Candidate", rf)
-				rf.currentRole = RoleCandidate
-				rf.mu.Unlock()
-			}
-		case RoleCandidate:
-			select {
-			case <-rf.broadcastVoteReq():
-				DPrintf("%s Upgrade to Leader", rf)
-				rf.broadcastHeartbeat()
-				rf.mu.Lock()
-				rf.matchIndex = make([]int, len(rf.peers))
-				rf.nextIndex = make([]int, len(rf.peers))
-				for i := range rf.peers {
-					rf.nextIndex[i] = rf.logLength()
-				}
-				rf.currentRole = RoleLeader
-				rf.mu.Unlock()
-			case <-rf.granted:
-				rf.mu.Lock()
-				rf.currentRole = RoleFollower
-				rf.mu.Unlock()
-			case <-rf.heartbeat:
-				rf.mu.Lock()
-				rf.currentRole = RoleFollower
-				rf.mu.Unlock()
-			case <-time.After(randElectTime()): // cannot get enough vote
-				// pass
-			}
-		case RoleLeader:
-			rf.broadcastHeartbeat()
-			time.Sleep(50 * time.Millisecond)
-		}
-	}
+	send(rf.killCh)
 }
 
 //
@@ -295,18 +257,53 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.resetTerm(0, NullPeer)
+	rf.state = Follower
+	rf.currentTerm = 0
+	rf.votedFor = NULL
+	rf.logs = make([]Log, 1)
+
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
 	rf.applyCh = applyCh
-	rf.heartbeat = make(chan int, 100)
-	rf.granted = make(chan int, 100)
-	rf.running = true
-	rf.logs = []LogEntry{{Term: 0, Command: nil}}
+	rf.voteCh = make(chan bool, 1)
+	rf.appendLogCh = make(chan bool, 1)
+	rf.killCh = make(chan bool, 1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.service()
 	return rf
+}
+
+func (rf *Raft) service() {
+	for {
+		select {
+		case <-rf.killCh:
+			return
+		default:
+		}
+
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
+
+		electionTime := time.Duration(rand.Intn(200)+300) * time.Millisecond
+		heartbeatTime := time.Duration(100) * time.Millisecond
+		switch state {
+		case Follower, Candidate:
+			select {
+			case <-rf.voteCh:
+			case <-rf.appendLogCh:
+			case <-time.After(electionTime):
+				rf.mu.Lock()
+				rf.beCandidate()
+				rf.mu.Unlock()
+			}
+		case Leader:
+			time.Sleep(heartbeatTime)
+			rf.broadcastHeartbeat()
+		}
+	}
 }

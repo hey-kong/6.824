@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"sync"
 	"sync/atomic"
 )
 
@@ -12,7 +11,7 @@ import (
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int
-	CandidateID  int
+	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
 }
@@ -31,101 +30,71 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
-
-	// reply false if term < currentTerm (§5.1)
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
 
 	if args.Term > rf.currentTerm {
-		reply.Term = args.Term
-		rf.resetTerm(args.Term, NullPeer)
+		rf.beFollower(args.Term)
 	}
 
-	// voted already
-	if rf.votedFor != NullPeer && rf.votedFor != args.CandidateID {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	if (args.Term < rf.currentTerm) || (rf.votedFor != NULL && rf.votedFor != args.CandidateId) {
+		// reply false if term < currentTerm (§5.1)
+		// if votedFor is not null and not candidateId, voted already
+	} else if args.LastLogTerm < rf.getLastLogTerm() || (args.LastLogTerm == rf.getLastLogTerm() && args.LastLogIndex < rf.getLastLogIdx()) {
+		// not up-to-date
+	} else {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		rf.state = Follower
+		rf.persist()
+		send(rf.voteCh)
 	}
-
-	// not up-to-date
-	if rf.lastTerm() > args.LastLogTerm ||
-		(rf.lastTerm() == args.LastLogTerm &&
-			rf.lastIndex() > args.LastLogIndex) {
-		return
-	}
-
-	DPrintf("%s Vote granted to %d", rf, args.CandidateID)
-	reply.VoteGranted = true
-	rf.resetTerm(args.Term, args.CandidateID)
-	rf.granted <- args.CandidateID
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	if ok := rf.peers[server].Call("Raft.RequestVote", args, reply); !ok {
-		return false
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.currentRole != RoleCandidate ||
-		rf.currentTerm != args.Term {
-		return false
-	}
-
-	if reply.Term > rf.currentTerm {
-		defer rf.persist()
-		rf.resetTerm(reply.Term, NullPeer)
-		return false
-	}
-	return true
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
 }
 
-func (rf *Raft) broadcastVoteReq() chan bool {
+func (rf *Raft) broadcastVoteReq() {
 	rf.mu.Lock()
-	rf.currentTerm++
-	rf.votedFor = rf.me
-	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateID:  rf.me,
-		LastLogIndex: rf.lastIndex(),
-		LastLogTerm:  rf.lastTerm(),
+	args := RequestVoteArgs{
+		rf.currentTerm,
+		rf.me,
+		rf.getLastLogIdx(),
+		rf.getLastLogTerm(),
 	}
-	DPrintf("%s start voting", rf)
-	rf.persist()
 	rf.mu.Unlock()
 
-	var voteCount, half int32
-	voteCount = 1
-	half = int32(len(rf.peers) / 2)
-	var wg sync.WaitGroup
-	isLeader := make(chan bool)
-	for i := range rf.peers {
-		if i != rf.me {
-			wg.Add(1)
-			go func(peer int) {
-				defer wg.Done()
-				var reply RequestVoteReply
-				if ok := rf.sendRequestVote(peer, args, &reply); !ok {
+	votes := int32(1)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		go func(idx int) {
+			reply := &RequestVoteReply{}
+			if ok := rf.sendRequestVote(idx, &args, reply); ok {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if reply.Term > rf.currentTerm {
+					rf.beFollower(reply.Term)
 					return
 				}
-
-				if reply.VoteGranted {
-					if atomic.AddInt32(&voteCount, 1) > half {
-						isLeader <- true
-						DPrintf("%s End voting", rf)
-						return
-					}
+				if rf.state != Candidate || rf.currentTerm != args.Term {
+					return
 				}
-			}(i)
-		}
+				if reply.VoteGranted {
+					atomic.AddInt32(&votes, 1)
+				}
+				if atomic.LoadInt32(&votes) > int32(len(rf.peers)/2) {
+					rf.beLeader()
+					rf.broadcastHeartbeat()
+					send(rf.voteCh)
+				}
+			}
+		}(i)
 	}
-	return isLeader
 }

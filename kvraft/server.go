@@ -1,32 +1,21 @@
 package raftkv
 
 import (
-	"log"
+	"strconv"
 	"sync"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
 )
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	Key   string
-	Value string
-	Op    string // "Get", "Put" or "Append"
-	Cid   int64  // client ID
-	Seq   int    // request sequence number
+	OpType string "operation type(eg. put/append)"
+	Key    string
+	Value  string
+	Cid    int64
+	SeqNum int
 }
 
 type KVServer struct {
@@ -38,107 +27,74 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	db        map[string]string     // 保存键值对
-	notify    map[int]chan struct{} // 每条log对于一个channel，在server上先写log再reply
-	cid2seq   map[int64]int         // 检测请求是否重复
+	db        map[string]string // 保存键值对
+	notify    map[int]chan Op   // 每条log对于一个channel，在server上先写log再reply
+	cid2seq   map[int64]int     // 检测请求是否重复
 	persister *raft.Persister
 
 	shutdown chan struct{} // shutdown chan
 }
 
+func equalOp(a Op, b Op) bool {
+	return a.Key == b.Key && a.Value == b.Value && a.OpType == b.OpType && a.SeqNum == b.SeqNum && a.Cid == b.Cid
+}
+
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	// 如果不是leader，直接返回
-	if _, isLeader := kv.rf.GetState(); !isLeader {
-		reply.WrongLeader = true
-		reply.Err = ""
+	//from hint: A simple solution is to enter every Get() (as well as each Put() and Append()) in the Raft log.
+	originOp := Op{"Get", args.Key, strconv.FormatInt(nrand(), 10), 0, 0}
+	reply.WrongLeader = true
+	index, _, isLeader := kv.rf.Start(originOp)
+	if !isLeader {
 		return
 	}
-
-	kv.mu.Lock()
-	command := Op{
-		Key: args.Key,
-		Op:  "Get",
-		Cid: args.Cid,
-		Seq: args.Seq,
-	}
-
-	// 将command作为log entry写入日志中
-	index, startTerm, _ := kv.rf.Start(command)
-	notify := make(chan struct{})
-	kv.notify[index] = notify
-	kv.mu.Unlock()
-
-	// 等待被apply
-	select {
-	case <-kv.shutdown:
-		DPrintf("Peer[%d]: shutdown - Get", kv.me)
-		return
-	case <-notify:
-		curTerm, isLeader := kv.rf.GetState()
-		// leader发生了变化
-		if !isLeader || startTerm != curTerm {
-			reply.WrongLeader = true
-			reply.Err = ErrNotLeader
-			return
-		}
-
+	ch := kv.putIfAbsent(index)
+	op := notified(ch)
+	if equalOp(op, originOp) {
+		reply.WrongLeader = false
 		kv.mu.Lock()
-		if value, ok := kv.db[args.Key]; ok {
-			reply.WrongLeader = false
-			reply.Value = value
-			reply.Err = OK
-			DPrintf("Peer[%d]: Get request for Key[%q] Value:%s", kv.me, args.Key, value)
-		} else {
-			reply.Err = ErrNoKey
-		}
+		reply.Value = kv.db[op.Key]
 		kv.mu.Unlock()
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	if _, isLeader := kv.rf.GetState(); !isLeader {
-		reply.WrongLeader = true
-		reply.Err = ErrNotLeader
+	originOp := Op{args.Op, args.Key, args.Value, args.Cid, args.Seq}
+	reply.WrongLeader = true
+	index, _, isLeader := kv.rf.Start(originOp)
+	if !isLeader {
 		return
 	}
-
-	kv.mu.Lock()
-	command := Op{
-		Key:   args.Key,
-		Value: args.Value,
-		Op:    args.Op,
-		Cid:   args.Cid,
-		Seq:   args.Seq,
-	}
-
-	// 将command作为log entry写入日志中
-	index, startTerm, _ := kv.rf.Start(command)
-	notify := make(chan struct{})
-	kv.notify[index] = notify
-	kv.mu.Unlock()
-
-	// 等待被apply
-	select {
-	case <-kv.shutdown:
-		DPrintf("Peer[%d]: shutdown - Get", kv.me)
-		return
-	case <-notify:
-		curTerm, isLeader := kv.rf.GetState()
-		// leader发生了变化
-		if !isLeader || startTerm != curTerm {
-			reply.WrongLeader = true
-			reply.Err = ErrNotLeader
-			return
-		}
-
-		kv.mu.Lock()
+	ch := kv.putIfAbsent(index)
+	op := notified(ch)
+	if equalOp(originOp, op) {
 		reply.WrongLeader = false
-		reply.Err = OK
-		DPrintf("Peer[%d]: Put/Append request for Key[%q] Value[%q]", kv.me, args.Key, args.Value)
-		kv.mu.Unlock()
 	}
+}
+
+func send(notifyCh chan Op, op Op) {
+	select {
+	case <-notifyCh:
+	default:
+	}
+	notifyCh <- op
+}
+
+func notified(ch chan Op) Op {
+	select {
+	case notifyArg := <-ch:
+		return notifyArg
+	case <-time.After(time.Duration(600) * time.Millisecond):
+		return Op{}
+	}
+}
+
+func (kv *KVServer) putIfAbsent(idx int) chan Op {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if _, ok := kv.notify[idx]; !ok {
+		kv.notify[idx] = make(chan Op, 1)
+	}
+	return kv.notify[idx]
 }
 
 //
@@ -183,7 +139,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.db = make(map[string]string)
-	kv.notify = make(map[int]chan struct{})
+	kv.notify = make(map[int]chan Op)
 	kv.cid2seq = make(map[int64]int)
 	kv.persister = persister
 
@@ -201,40 +157,28 @@ func (kv *KVServer) applyDaemon() {
 	for {
 		select {
 		case <-kv.shutdown:
-			DPrintf("Peer[%d]: shutdown - applyDaemon", kv.me)
 			return
-		case applyMsg, ok := <-kv.applyCh:
+		case applyMsg := <-kv.applyCh:
 			if !applyMsg.CommandValid {
-				snapshot := applyMsg.Command.([]byte)
-				kv.decodeSnapshot(snapshot)
+				kv.decodeSnapshot(applyMsg.SnapShot)
 				continue
 			}
-			if ok && applyMsg.Command != nil && applyMsg.CommandValid {
-				command := applyMsg.Command.(Op)
-				kv.mu.Lock()
-				if seq, ok := kv.cid2seq[command.Cid]; !ok || command.Seq > seq {
-					kv.cid2seq[command.Cid] = command.Seq
-					switch command.Op {
-					case "Get":
-						// do nothing
-					case "Put":
-						kv.db[command.Key] = command.Value
-					case "Append":
-						kv.db[command.Key] += command.Value
-					default:
-						DPrintf("Peer[%d]: receive unknown command: %s",
-							kv.me, command.Op)
-					}
+			op := applyMsg.Command.(Op)
+			kv.mu.Lock()
+			maxSeq, found := kv.cid2seq[op.Cid]
+			if !found || op.SeqNum > maxSeq {
+				switch op.OpType {
+				case "Put":
+					kv.db[op.Key] = op.Value
+				case "Append":
+					kv.db[op.Key] += op.Value
 				}
-
-				// apply后需要通知当前节点
-				if notify, ok := kv.notify[applyMsg.CommandIndex]; ok && notify != nil {
-					close(notify)
-					delete(kv.notify, applyMsg.CommandIndex)
-				}
-				kv.checkSnapshot(applyMsg.CommandIndex)
-				kv.mu.Unlock()
+				kv.cid2seq[op.Cid] = op.SeqNum
 			}
+			kv.mu.Unlock()
+			notifyCh := kv.putIfAbsent(applyMsg.CommandIndex)
+			kv.checkSnapshot(applyMsg.CommandIndex)
+			send(notifyCh, op)
 		}
 	}
 }

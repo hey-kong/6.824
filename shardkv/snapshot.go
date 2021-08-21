@@ -15,12 +15,12 @@ func (kv *ShardKV) checkSnapshot(index int) {
 	}
 
 	if float64(kv.persister.RaftStateSize())/float64(kv.maxraftstate) > 0.95 {
-		go kv.encodeSnapshot(index)
+		go kv.rf.DoSnapshot(index, kv.encodeSnapshot())
 	}
 }
 
 // 快照数据编码
-func (kv *ShardKV) encodeSnapshot(index int) {
+func (kv *ShardKV) encodeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	kv.mu.Lock()
@@ -32,7 +32,7 @@ func (kv *ShardKV) encodeSnapshot(index int) {
 	e.Encode(kv.cfg)
 	e.Encode(kv.garbages)
 	kv.mu.Unlock()
-	kv.rf.StartSnapshotOn(index, w.Bytes())
+	return w.Bytes()
 }
 
 // 快照数据解码

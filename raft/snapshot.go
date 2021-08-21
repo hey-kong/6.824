@@ -11,9 +11,9 @@ type InstallSnapshotArgs struct {
 	LeaderId          int    // so follower can redirect clients
 	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
 	LastIncludedTerm  int    // term of lastIncludedIndex
-	Offset            int    // byte offset where chunk is positioned in the snapshot file
 	Data              []byte // raw bytes of the snapshot chunk, starting at offset
-	Done              bool   // true if this is the last chunk
+	// Offset         int    // byte offset where chunk is positioned in the snapshot file
+	// Done           bool   // true if this is the last chunk
 }
 
 type InstallSnapshotReply struct {
@@ -25,61 +25,32 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
-
-	// 1. Reply immediately if term < currentTerm
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm { //Reply immediately if term < currentTerm
 		return
 	}
-
-	// check no higher term
-	if args.Term > rf.currentTerm {
-		reply.Term = args.Term
-		rf.resetTerm(args.Term, NullPeer)
+	if args.Term > rf.currentTerm { //all server rule 1 If RPC request or response contains term T > currentTerm:
+		rf.beFollower(args.Term) // set currentTerm = T, convert to follower (§5.1)
 	}
-	rf.heartbeat <- args.LeaderId
-
-	// check have the latest last include index
-	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+	send(rf.appendLogCh)                                //If election timeout elapses without receiving AppendEntries RPC from current leader
+	if args.LastIncludedIndex <= rf.lastIncludedIndex { // discard any existing or partial snapshot with a smaller index
 		return
 	}
-
-	// 2. Create new snapshot file if first chunk (offset is 0)
-	// 3. Write data into snapshot file at given offset. Write into go objects,
-	// no need of offset
-	// 4. Reply and wait for more data chunks if done is false
-	if !args.Done {
+	applyMsg := ApplyMsg{CommandValid: false, SnapShot: args.Data}
+	//If existing log entry has same index and term as snapshot’s last included entry,retain log entries following it and reply
+	if args.LastIncludedIndex < rf.logLen()-1 {
+		rf.logs = append(make([]Log, 0), rf.logs[args.LastIncludedIndex-rf.lastIncludedIndex:]...)
+	} else { //7. Discard the entire log
+		rf.logs = []Log{{args.LastIncludedTerm, nil}}
+	}
+	//Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
+	rf.lastIncludedIndex, rf.lastIncludedTerm = args.LastIncludedIndex, args.LastIncludedTerm
+	rf.persistWithSnapShot(args.Data)
+	rf.commitIndex = max(rf.commitIndex, rf.lastIncludedIndex)
+	rf.lastApplied = max(rf.lastApplied, rf.lastIncludedIndex)
+	if rf.lastApplied > rf.lastIncludedIndex {
 		return
-	}
-
-	// 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
-	// 6. If existing log entry has the same index and term as snapshot’s last included entry,
-	// retain log entries following it and reply
-	// 7. Discard the entire log
-	if rf.lastIncludedIndex <= args.LastIncludedIndex {
-		rf.logs = []LogEntry{{Term: args.LastIncludedTerm, Command: nil}}
-	} else {
-		rf.logs = rf.logRange(args.LastIncludedIndex, rf.logEnd())
-	}
-
-	// update local index and term
-	rf.lastIncludedIndex = args.LastIncludedIndex
-	rf.lastIncludedTerm = args.LastIncludedTerm
-
-	rf.persistStatesAndSnapshot(args.Data)
-
-	if rf.lastIncludedIndex > rf.commitIndex {
-		rf.commitIndex = rf.lastIncludedIndex
-	}
-	if rf.lastIncludedIndex > rf.lastApplied {
-		rf.lastApplied = rf.lastIncludedIndex
-	}
-
-	// 8. reset state machine using snapshot contents (and load snapshot’s cluster configuration)
-	rf.applyCh <- ApplyMsg{
-		CommandIndex: -1,
-		Command:      args.Data,
-		CommandValid: false, // reset the state machine
-	}
+	} //snapshot is older than kvserver's db, so reply immediately
+	rf.applyCh <- applyMsg
 }
 
 func (rf *Raft) persistStatesAndSnapshot(snapshot []byte) {
@@ -100,46 +71,34 @@ func (rf *Raft) sendInstallSnapshot(peer int, args *InstallSnapshotArgs, reply *
 }
 
 func (rf *Raft) sendSnapshot(peer int) {
-	rf.mu.Lock()
-	role := rf.currentRole
 	args := InstallSnapshotArgs{
 		Term:              rf.currentTerm,
-		LeaderId:          rf.me,
 		LastIncludedIndex: rf.lastIncludedIndex,
 		LastIncludedTerm:  rf.lastIncludedTerm,
+		LeaderId:          rf.me,
 		Data:              rf.persister.ReadSnapshot(),
-		Done:              true,
 	}
+
 	rf.mu.Unlock()
-
-	if role != RoleLeader {
-		return
-	}
-
-	var reply InstallSnapshotReply
-	if ok := rf.sendInstallSnapshot(peer, &args, &reply); !ok {
-		return
-	}
+	reply := InstallSnapshotReply{}
+	ret := rf.sendInstallSnapshot(peer, &args, &reply)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	if reply.Term > rf.currentTerm {
-		rf.resetTerm(reply.Term, NullPeer)
+	if !ret || rf.state != Leader || rf.currentTerm != args.Term {
 		return
 	}
 
-	if rf.currentRole != RoleLeader ||
-		reply.Term < rf.currentTerm /* not the same term */ {
+	if reply.Term > rf.currentTerm {
+		rf.beFollower(reply.Term)
 		return
 	}
 
 	// update succeeded
-	rf.nextIndex[peer] = args.LastIncludedIndex + 1
-	rf.matchIndex[peer] = args.LastIncludedIndex
+	rf.updateMatchIndex(peer, rf.lastIncludedIndex)
 }
 
-func (rf *Raft) StartSnapshotOn(index int, snapshot []byte) {
+func (rf *Raft) DoSnapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -149,10 +108,10 @@ func (rf *Raft) StartSnapshotOn(index int, snapshot []byte) {
 		return
 	}
 
-	rf.logs = append(make([]LogEntry, 0), rf.logRange(index, rf.logEnd())...)
+	rf.logs = append(make([]Log, 0), rf.logs[index-rf.lastIncludedIndex:]...)
 	// update new lastIncludedIndex and lastIncludedTerm
 	rf.lastIncludedIndex = index
-	rf.lastIncludedTerm = rf.logAt(index).Term
+	rf.lastIncludedTerm = rf.getLog(index).Term
 	// save snapshot
 	rf.persistStatesAndSnapshot(snapshot)
 }

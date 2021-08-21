@@ -13,7 +13,7 @@ func (kv *KVServer) checkSnapshot(index int) {
 	}
 
 	if float64(kv.persister.RaftStateSize())/float64(kv.maxraftstate) > 0.95 {
-		go kv.rf.StartSnapshotOn(index, kv.encodeSnapshot())
+		go kv.rf.DoSnapshot(index, kv.encodeSnapshot())
 	}
 }
 

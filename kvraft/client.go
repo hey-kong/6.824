@@ -8,7 +8,7 @@ import (
 	"6.824/labrpc"
 )
 
-const RetryInterval = 600 * time.Millisecond
+const RetryInterval = 100 * time.Millisecond
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -48,36 +48,17 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	// You will have to modify this function.
-	ck.seq++
+	index := ck.lastLeader
 	args := GetArgs{Key: key, Cid: ck.cid, Seq: ck.seq}
-
 	for {
 		reply := GetReply{}
-		doneCh := make(chan bool)
-		go func() {
-			// 发送RPC，等待reply
-			ok := ck.servers[ck.lastLeader].Call("KVServer.Get", &args, &reply)
-			doneCh <- ok
-		}()
-
-		select {
-		case <-time.After(RetryInterval):
-			DPrintf("clerk(%d) retry Get after timeout\n", ck.cid)
-			continue
-		case ok := <-doneCh:
-			// 收到响应后，并且是leader返回的，那么说明这个命令已经执行了
-			if ok && !reply.WrongLeader {
-				if reply.Err == OK {
-					return reply.Value
-				} else {
-					return ""
-				}
-			}
+		ok := ck.servers[index].Call("KVServer.Get", &args, &reply)
+		if ok && !reply.WrongLeader {
+			ck.lastLeader = index
+			return reply.Value
 		}
-
-		// 不是leader返回的，换一个server重发
-		ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
+		index = (index + 1) % len(ck.servers)
+		time.Sleep(RetryInterval)
 	}
 }
 
@@ -92,32 +73,18 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	index := ck.lastLeader
+	args := PutAppendArgs{key, value, op, ck.cid, ck.seq}
 	ck.seq++
-	args := PutAppendArgs{Key: key, Value: value, Op: op, Cid: ck.cid, Seq: ck.seq}
-
 	for {
 		reply := PutAppendReply{}
-		doneCh := make(chan bool)
-		go func() {
-			// 发送RPC，等待reply
-			ok := ck.servers[ck.lastLeader].Call("KVServer.PutAppend", &args, &reply)
-			doneCh <- ok
-		}()
-
-		select {
-		case <-time.After(RetryInterval):
-			DPrintf("clerk(%d) retry PutAppend after timeout\n", ck.cid)
-			continue
-		case ok := <-doneCh:
-			// 收到响应后，并且是leader返回的，那么说明这个命令已经执行了
-			if ok && !reply.WrongLeader {
-				return
-			}
+		ok := ck.servers[index].Call("KVServer.PutAppend", &args, &reply)
+		if ok && !reply.WrongLeader {
+			ck.lastLeader = index
+			return
 		}
-
-		// 不是leader返回的，换一个server重发
-		ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
+		index = (index + 1) % len(ck.servers)
+		time.Sleep(RetryInterval)
 	}
 }
 

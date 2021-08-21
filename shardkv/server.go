@@ -418,8 +418,7 @@ func (kv *ShardKV) applyDaemon() {
 			return
 		case applyMsg := <-kv.applyCh:
 			if !applyMsg.CommandValid {
-				snapshot := applyMsg.Command.([]byte)
-				kv.decodeSnapshot(snapshot)
+				kv.decodeSnapshot(applyMsg.SnapShot)
 				continue
 			}
 			kv.apply(applyMsg)
