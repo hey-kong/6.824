@@ -23,7 +23,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.beFollower(args.Term)
 	}
-	send(rf.appendLogCh)
+	send(rf.appendCh)
 
 	reply.Term = rf.currentTerm
 	reply.Success = false

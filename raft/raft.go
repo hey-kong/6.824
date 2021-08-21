@@ -97,8 +97,8 @@ type Raft struct {
 	killCh  chan bool     //for Kill()
 
 	//handle rpc
-	voteCh      chan bool
-	appendLogCh chan bool
+	voteCh   chan bool
+	appendCh chan bool
 }
 
 // return currentTerm and whether this server
@@ -109,7 +109,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	isleader = (rf.state == Leader)
+	isleader = rf.state == Leader
 	return term, isleader
 }
 
@@ -119,14 +119,6 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	rf.persister.SaveRaftState(rf.encodeRaftState())
-}
-
-func (rf *Raft) persistWithSnapShot(snapshot []byte) {
-	rf.persister.SaveStateAndSnapshot(rf.encodeRaftState(), snapshot)
-}
-
-func (rf *Raft) encodeRaftState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -134,7 +126,8 @@ func (rf *Raft) encodeRaftState() []byte {
 	e.Encode(rf.logs)
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
-	return w.Bytes()
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -267,7 +260,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 	rf.voteCh = make(chan bool, 1)
-	rf.appendLogCh = make(chan bool, 1)
+	rf.appendCh = make(chan bool, 1)
 	rf.killCh = make(chan bool, 1)
 
 	// initialize from state persisted before a crash
@@ -295,7 +288,7 @@ func (rf *Raft) service() {
 		case Follower, Candidate:
 			select {
 			case <-rf.voteCh:
-			case <-rf.appendLogCh:
+			case <-rf.appendCh:
 			case <-time.After(electionTime):
 				rf.mu.Lock()
 				rf.beCandidate()

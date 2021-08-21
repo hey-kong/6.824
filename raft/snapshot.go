@@ -23,42 +23,60 @@ type InstallSnapshotReply struct {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm { //Reply immediately if term < currentTerm
+
+	// 1. reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
 		return
 	}
-	if args.Term > rf.currentTerm { //all server rule 1 If RPC request or response contains term T > currentTerm:
-		rf.beFollower(args.Term) // set currentTerm = T, convert to follower (§5.1)
+	if args.Term > rf.currentTerm {
+		rf.beFollower(args.Term)
 	}
-	send(rf.appendLogCh)                                //If election timeout elapses without receiving AppendEntries RPC from current leader
-	if args.LastIncludedIndex <= rf.lastIncludedIndex { // discard any existing or partial snapshot with a smaller index
+	send(rf.appendCh)
+
+	// check snapshot may expire by lock competition, otherwise rf.logs may overflow below
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-	applyMsg := ApplyMsg{CommandValid: false, SnapShot: args.Data}
-	//If existing log entry has same index and term as snapshot’s last included entry,retain log entries following it and reply
+
+	// 2. create new snapshot file if first chunk (offset is 0)
+	// 3. write data into snapshot file at given offset
+	// 4. reply and wait for more data chunks if done is false
+	// 5. save snapshot file, discard any existing or partial snapshot with a smaller index
+
+	// 6. if existing log entry has the same index and term as snapshot's last included entry,
+	// retain log entries following it and reply
 	if args.LastIncludedIndex < rf.logLen()-1 {
+		// the args.LastIncludedIndex log has agreed, if there are more logs, just retain them
 		rf.logs = append(make([]Log, 0), rf.logs[args.LastIncludedIndex-rf.lastIncludedIndex:]...)
-	} else { //7. Discard the entire log
+	} else {
+		// 7. discard the entire log
+		// empty log use for AppendEntries RPC consistency check
 		rf.logs = []Log{{args.LastIncludedTerm, nil}}
 	}
-	//Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
+
+	// update snapshot state and persist them
 	rf.lastIncludedIndex, rf.lastIncludedTerm = args.LastIncludedIndex, args.LastIncludedTerm
-	rf.persistWithSnapShot(args.Data)
+	rf.persistStatesAndSnapshot(args.Data)
+
+	// force the follower's log catch up with leader
 	rf.commitIndex = max(rf.commitIndex, rf.lastIncludedIndex)
 	rf.lastApplied = max(rf.lastApplied, rf.lastIncludedIndex)
 	if rf.lastApplied > rf.lastIncludedIndex {
 		return
-	} //snapshot is older than kvserver's db, so reply immediately
+	}
+
+	// 8. reset state machine using snapshot contents (and load snapshot's cluster configuration)
+	applyMsg := ApplyMsg{CommandValid: false, SnapShot: args.Data}
 	rf.applyCh <- applyMsg
 }
 
 func (rf *Raft) persistStatesAndSnapshot(snapshot []byte) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
-	e.Encode(rf.currentTerm)
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
@@ -81,11 +99,11 @@ func (rf *Raft) sendSnapshot(peer int) {
 
 	rf.mu.Unlock()
 	reply := InstallSnapshotReply{}
-	ret := rf.sendInstallSnapshot(peer, &args, &reply)
+	ok := rf.sendInstallSnapshot(peer, &args, &reply)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if !ret || rf.state != Leader || rf.currentTerm != args.Term {
+	if !ok || rf.state != Leader || rf.currentTerm != args.Term {
 		return
 	}
 
